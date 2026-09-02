@@ -660,7 +660,22 @@ fn main() {
 
     if open_nvim {
         use std::os::unix::process::CommandExt;
-        let err = Command::new("nvim").arg(&path).exec();
+        // The dump file carries ANSI escapes (EditScrollback ansi=true), which nvim
+        // would show as raw `[36m` noise. Hand nvim a plain, stripped copy instead —
+        // we already parsed the text into `lines`.
+        let plain: String = app
+            .lines
+            .iter()
+            .map(|l| l.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tmp = format!("/tmp/lvim-zcopy-plain-{}.txt", std::process::id());
+        let target = if std::fs::write(&tmp, plain).is_ok() {
+            tmp
+        } else {
+            path.clone()
+        };
+        let err = Command::new("nvim").arg(&target).exec();
         eprintln!("lvim-zcopy: could not exec nvim: {err}");
         std::process::exit(1);
     }
