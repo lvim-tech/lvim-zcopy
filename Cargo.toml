@@ -1,0 +1,14 @@
+[package]
+name = "lvim-zcopy"
+version = "0.1.0"
+edition = "2021"
+authors = ["lvim-tech"]
+description = "Keyboard copy-mode for zellij panes — tmux-style visual selection to the Wayland clipboard"
+
+[dependencies]
+crossterm = "0.28"
+
+[profile.release]
+lto = true
+opt-level = "z"
+strip = true
