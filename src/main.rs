@@ -394,7 +394,15 @@ fn paints_nothing(line: &[char], style: &[Cell]) -> bool {
 }
 
 // Parse the (possibly ANSI-styled) dump into plain chars + a parallel colour map.
-fn load(path: &str) -> (Vec<Vec<char>>, Vec<Vec<Cell>>) {
+/// Parse the dump, and say how many blank rows were cut from the bottom.
+///
+/// The count is not bookkeeping: those rows are where the terminal's cursor
+/// was sitting, so they are the only record of how the text was framed on
+/// screen. The buffer is better off without them — nothing should scroll
+/// through dead space, or hand it to nvim — but the view has to open with that
+/// gap put back, or the text arrives at a different height than the pane had
+/// it. See `main`.
+fn load(path: &str) -> (Vec<Vec<char>>, Vec<Vec<Cell>>, usize) {
     let raw = std::fs::read(path).unwrap_or_default();
     let text = String::from_utf8_lossy(&raw);
     let ch: Vec<char> = text.chars().collect();
@@ -466,8 +474,14 @@ fn load(path: &str) -> (Vec<Vec<char>>, Vec<Vec<Cell>>) {
             i += 1;
         }
     }
-    lines.push(cur_c);
-    styles.push(cur_s);
+    // A trailing newline ENDS the last line; it does not begin another. Pushing
+    // one anyway invents a row the terminal never had, and since the count of
+    // trimmed rows is what re-frames the first view, that phantom would open it
+    // one row too high.
+    if !cur_c.is_empty() || lines.is_empty() {
+        lines.push(cur_c);
+        styles.push(cur_s);
+    }
 
     // A dump ends in whatever was below the last output: empty lines, and lines
     // padded out with spaces. Both are dead space at the bottom of copy mode.
@@ -475,6 +489,7 @@ fn load(path: &str) -> (Vec<Vec<char>>, Vec<Vec<Cell>>) {
     // "Blank" has to mean blank on screen, not blank in the text. Spaces with a
     // background, a reverse or an underline are a visible bar — a statusline is
     // exactly that — and trimming one would delete something the pane showed.
+    let mut trimmed = 0usize;
     while lines.len() > 1
         && lines
             .last()
@@ -483,12 +498,13 @@ fn load(path: &str) -> (Vec<Vec<char>>, Vec<Vec<Cell>>) {
     {
         lines.pop();
         styles.pop();
+        trimmed += 1;
     }
     if lines.is_empty() {
         lines.push(Vec::new());
         styles.push(Vec::new());
     }
-    (lines, styles)
+    (lines, styles, trimmed)
 }
 
 /// One colour, the way the `.spans` sidecar spells it: `-` for the terminal's
@@ -626,7 +642,16 @@ fn draw(app: &App) -> std::io::Result<()> {
     // Every match on screen is painted, not only the one under the cursor:
     // seeing where the others are is most of what a search is for. Computed
     // once here rather than per row, since the needle does not change.
-    let needle: Vec<char> = app.last_query.chars().collect();
+    //
+    // While the query is being typed it is the live buffer, not the last
+    // committed one: the matches light up as the letters go in, which is how
+    // you find out you have typed enough — waiting for Enter to see whether it
+    // matched anything makes the search a guess.
+    let needle: Vec<char> = if app.mode == Mode::Search {
+        app.input.chars().collect()
+    } else {
+        app.last_query.chars().collect()
+    };
     for r in 0..app.rows {
         queue!(
             out,
@@ -759,9 +784,25 @@ fn main() {
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    let (lines, style) = load(&path);
+    let (lines, style, trimmed) = load(&path);
     let (cols, rows) = size().unwrap_or((80, 24));
     let mut app = App::new(lines, style, cols as usize, (rows as usize).saturating_sub(1).max(1));
+    // Open with the text where the pane had it. `trimmed` is how many blank
+    // rows stood below it on screen; leaving that many rows empty at the
+    // bottom of the first view puts every line back at the height it had a
+    // moment ago, which is what makes entering copy mode feel like the pane
+    // stopping rather than a different screen appearing. Scrolling from here
+    // works normally — G still takes the last line to the bottom row.
+    // Our window is one row shorter than the pane -- the status bar takes it --
+    // so the pane's framing does not always fit. A blank row is what gives way,
+    // never a line of text: when the whole dump fits on screen it simply starts
+    // at the top, with the gap below it as the pane had it.
+    let framed = app.rows.saturating_sub(trimmed).max(1);
+    app.top = if app.lines.len() > app.rows {
+        app.lines.len().saturating_sub(framed)
+    } else {
+        0
+    };
 
     enable_raw_mode().ok();
     execute!(stdout(), EnterAlternateScreen).ok();
@@ -1172,10 +1213,41 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("dump");
         std::fs::write(&path, body).expect("write");
-        let out = load(path.to_str().unwrap_or_default());
+        let (lines, style, _) = load(path.to_str().unwrap_or_default());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
-        out
+        (lines, style)
+    }
+
+    /// Same as `parse_file`, but keeps the trimmed-row count.
+    fn parse_file_framed(tag: &str, body: &str) -> (usize, usize) {
+        let dir = std::env::temp_dir().join(format!(
+            "lvim-zcopy-test-{}-{tag}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("dump");
+        std::fs::write(&path, body).expect("write");
+        let (lines, _, trimmed) = load(path.to_str().unwrap_or_default());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+        (lines.len(), trimmed)
+    }
+
+    #[test]
+    fn the_trimmed_rows_are_counted_so_the_view_can_put_them_back() {
+        // Those rows are where the terminal's cursor was: the only record of
+        // how high on the screen the text sat. A zellij dump really does end
+        // in a run of them -- measured, 14 of 58 on this machine.
+        let (kept, trimmed) = parse_file_framed("count", "one\ntwo\n\n\n\n\n");
+        assert_eq!((kept, trimmed), (2, 4));
+        // Nothing to put back when the text runs to the last row. The trailing
+        // newline ends "two"; it does not add a row.
+        let (kept, trimmed) = parse_file_framed("none", "one\ntwo\n");
+        assert_eq!((kept, trimmed), (2, 0));
+        // ...and without the trailing newline the answer is the same.
+        let (kept, trimmed) = parse_file_framed("nonl", "one\ntwo");
+        assert_eq!((kept, trimmed), (2, 0));
     }
 
     #[test]
@@ -1344,7 +1416,7 @@ mod tests {
         std::fs::write(&path, "\x1b[48;5;236m\x1b[38;5;203mred\x1b[0m plain\nsecond\n")
             .expect("write");
 
-        let (lines, style) = load(path.to_str().unwrap_or_default());
+        let (lines, style, _) = load(path.to_str().unwrap_or_default());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
 

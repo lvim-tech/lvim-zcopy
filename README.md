@@ -45,7 +45,13 @@ so it pastes with `Ctrl+V` *and* middle-click.
 | `q` / `Esc` | quit |
 
 The cursor starts on the **last line** (like tmux copy-mode); scroll up from
-there.
+there. The first view is framed as the pane was: a zellij dump ends in the
+blank rows that stood below the text on screen (measured: 40 of 57 on an idle
+pane), and although those rows are cut from the buffer — nothing should scroll
+through dead space, or reach nvim — the view opens with the gap put back, so
+the text arrives at the height it had a moment ago. Our window is one row
+shorter than the pane, since the status bar takes it, so when the framing does
+not fit it is a blank row that gives way and never a line of text.
 
 ## Install
 
@@ -78,7 +84,9 @@ hand the same buffer to nvim.
 - Selection, search and yank operate on plain text; the ANSI colours are a
   render-only layer, so copied text never carries escape codes.
 - **Search** highlights every match on screen, not only the one under the
-  cursor, with the current one in a brighter colour. `n` and `N` step through
+  cursor, with the current one in a brighter colour, and it lights up **as you
+  type** rather than on Enter — waiting for Enter to find out whether anything
+  matched makes the search a guess. `n` and `N` step through
   *every* match — including a second one on the same line, which the older
   per-line search skipped. Both the stepping and the painting go through one
   matcher, so what `n` visits and what the screen lights up cannot become two
