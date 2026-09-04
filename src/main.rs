@@ -49,6 +49,13 @@ struct Cell {
     reverse: bool,
 }
 
+/// Search matches, and the one the cursor sits on. Both carry a dark
+/// foreground because they set a light background over whatever the dump had
+/// there, and the text has to stay readable on it.
+const SEARCH_BG: Color = Color::DarkYellow;
+const SEARCH_CUR_BG: Color = Color::Yellow;
+const SEARCH_FG: Color = Color::Black;
+
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
     Normal,
@@ -196,32 +203,60 @@ impl App {
         }
     }
 
+    /// Move to the next match, in whichever direction, wrapping once.
+    ///
+    /// Every match, not the first one on each line: the drawing highlights all
+    /// of them, and a cursor that skipped past a highlighted match to the next
+    /// *line* would be visibly wrong. Both ends use [`matches_in`], so what `n`
+    /// steps through and what the screen paints can never be two different
+    /// answers.
     fn search(&mut self, forward: bool) {
-        if self.last_query.is_empty() {
+        let needle: Vec<char> = self.last_query.chars().collect();
+        if needle.is_empty() || self.lines.is_empty() {
             return;
         }
-        let n = self.lines.len();
-        if n == 0 {
-            return;
-        }
-        let needle: String = self.last_query.clone();
-        for step in 1..=n {
-            let li = if forward {
-                (self.cy + step) % n
-            } else {
-                (self.cy + n - step) % n
-            };
-            let hay: String = self.lines[li].iter().collect();
-            if let Some(bytepos) = hay.find(&needle) {
-                let col = hay[..bytepos].chars().count();
+        match self.next_match(&needle, forward) {
+            Some((li, col)) => {
                 self.cy = li;
                 self.cx = col;
                 self.clamp_cx();
                 self.msg = format!("/{}", self.last_query);
-                return;
+            }
+            None => self.msg = format!("not found: {}", self.last_query),
+        }
+    }
+
+    /// The match after (or before) the cursor, wrapping through the whole
+    /// buffer exactly once and ending back on the cursor's own line — so a
+    /// second match earlier on that line is reached rather than skipped.
+    fn next_match(&self, needle: &[char], forward: bool) -> Option<(usize, usize)> {
+        let n = self.lines.len();
+        for step in 0..=n {
+            let li = if forward {
+                (self.cy + step) % n
+            } else {
+                (self.cy + n - step % n) % n
+            };
+            let starts: Vec<usize> = matches_in(self.lines.get(li)?, needle)
+                .into_iter()
+                .map(|(start, _)| start)
+                .collect();
+            // The first and last steps are both the cursor's own line, seen
+            // from either side of the cursor: on the way out only what lies
+            // beyond it, and on the wrap back only what lies behind.
+            let picked = match (forward, step) {
+                (true, 0) => starts.iter().copied().find(|s| *s > self.cx),
+                (true, s) if s == n => starts.iter().copied().find(|s| *s <= self.cx),
+                (true, _) => starts.first().copied(),
+                (false, 0) => starts.iter().copied().rfind(|s| *s < self.cx),
+                (false, s) if s == n => starts.iter().copied().rfind(|s| *s >= self.cx),
+                (false, _) => starts.last().copied(),
+            };
+            if let Some(col) = picked {
+                return Some((li, col));
             }
         }
-        self.msg = format!("not found: {}", self.last_query);
+        None
     }
 }
 
@@ -588,6 +623,10 @@ fn write_style(out: &mut impl Write, cell: Cell) -> std::io::Result<()> {
 
 fn draw(app: &App) -> std::io::Result<()> {
     let mut out = stdout();
+    // Every match on screen is painted, not only the one under the cursor:
+    // seeing where the others are is most of what a search is for. Computed
+    // once here rather than per row, since the needle does not change.
+    let needle: Vec<char> = app.last_query.chars().collect();
     for r in 0..app.rows {
         queue!(
             out,
@@ -602,6 +641,7 @@ fn draw(app: &App) -> std::io::Result<()> {
         }
         let line = &app.lines[li];
         let styl = &app.style[li];
+        let hits = matches_in(line, &needle);
         let end = (app.left + app.cols).min(line.len());
         // The style last written to the terminal. The row began with a reset,
         // so that is the default cell; a run of identically-styled characters
@@ -609,6 +649,17 @@ fn draw(app: &App) -> std::io::Result<()> {
         let mut applied = Cell::default();
         for (col, ch) in line.iter().enumerate().take(end).skip(app.left) {
             let mut want = styl.get(col).copied().unwrap_or_default();
+            // A match replaces the dump's own colours rather than blending with
+            // them: the point of the highlight is to be findable at a glance,
+            // and a match that inherited a dark background from the text under
+            // it would be the one nobody sees. Reverse goes with them, or the
+            // new colours would arrive already inverted.
+            if let Some((start, _)) = hits.iter().find(|(s, e)| col >= *s && col < *e) {
+                let current = li == app.cy && *start == app.cx;
+                want.fg = Some(SEARCH_FG);
+                want.bg = Some(if current { SEARCH_CUR_BG } else { SEARCH_BG });
+                want.reverse = false;
+            }
             // The selection inverts whatever the cell already looks like rather
             // than forcing one colour on it: a cell that is already reversed
             // (a statusline, a highlighted match) has to come back OUT of
@@ -661,6 +712,32 @@ fn draw(app: &App) -> std::io::Result<()> {
         queue!(out, MoveTo(scr_x, scr_y))?;
     }
     out.flush()
+}
+
+/// Every match of `needle` in `line`, as `(start, end)` column pairs.
+///
+/// Columns, not bytes: a column is what the cursor, the selection and the
+/// drawing all count in, and converting to a String to use `str::find` only to
+/// count the characters back is how a search and a highlight drift apart on a
+/// line with any Cyrillic in it.
+///
+/// Non-overlapping, like vim: after a match the scan resumes at its end, so
+/// `aa` in `aaaa` is two matches and not three.
+fn matches_in(line: &[char], needle: &[char]) -> Vec<(usize, usize)> {
+    if needle.is_empty() || needle.len() > line.len() {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= line.len() {
+        if line[i..i + needle.len()] == *needle {
+            hits.push((i, i + needle.len()));
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    hits
 }
 
 fn is_word(c: char) -> bool {
@@ -928,6 +1005,97 @@ mod tests {
             apply_sgr(p, &mut cell);
         }
         cell
+    }
+
+    // -- search ---------------------------------------------------------
+
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
+    /// An App over the given lines, cursor where the program puts it: the last
+    /// line, column 0.
+    fn app_over(text: &[&str], query: &str) -> App {
+        let lines: Vec<Vec<char>> = text.iter().map(|l| chars(l)).collect();
+        let style = vec![Vec::new(); lines.len()];
+        let mut app = App::new(lines, style, 80, 24);
+        app.last_query = query.to_owned();
+        app
+    }
+
+    #[test]
+    fn every_match_is_found_not_just_the_first_on_a_line() {
+        assert_eq!(
+            matches_in(&chars("foo bar foo"), &chars("foo")),
+            vec![(0, 3), (8, 11)]
+        );
+        // Non-overlapping, like vim: `aa` in `aaaa` is two matches, not three.
+        assert_eq!(matches_in(&chars("aaaa"), &chars("aa")), vec![(0, 2), (2, 4)]);
+        assert!(matches_in(&chars("abc"), &chars("")).is_empty());
+        assert!(matches_in(&chars("ab"), &chars("abc")).is_empty());
+    }
+
+    #[test]
+    fn matches_are_counted_in_columns_not_bytes() {
+        // The cursor, the selection and the drawing all count columns. Going
+        // through a String to use str::find would return byte offsets, and on
+        // this line they are nowhere near the columns.
+        assert_eq!(
+            matches_in(&chars("привет свят привет"), &chars("привет")),
+            vec![(0, 6), (12, 18)]
+        );
+    }
+
+    #[test]
+    fn n_steps_through_the_matches_on_one_line() {
+        // The bug the highlighting would otherwise expose: the old search took
+        // the first match per LINE, so on this line `n` stood still while two
+        // matches sat lit up on screen.
+        let mut app = app_over(&["foo bar foo"], "foo");
+        assert_eq!((app.cy, app.cx), (0, 0));
+        app.search(true);
+        assert_eq!((app.cy, app.cx), (0, 8), "n did not reach the second match");
+        // ...and wraps back round to the first.
+        app.search(true);
+        assert_eq!((app.cy, app.cx), (0, 0));
+    }
+
+    #[test]
+    fn capital_n_steps_back_through_the_same_line() {
+        let mut app = app_over(&["foo bar foo"], "foo");
+        app.cx = 8;
+        app.search(false);
+        assert_eq!((app.cy, app.cx), (0, 0));
+        // Before the first match there is nothing left on this line, so it
+        // wraps to the last one.
+        app.search(false);
+        assert_eq!((app.cy, app.cx), (0, 8));
+    }
+
+    #[test]
+    fn the_search_crosses_lines_and_wraps_once() {
+        let mut app = app_over(&["one hit", "nothing", "two hit hit"], "hit");
+        // Starts on the last line, column 0.
+        app.search(true);
+        assert_eq!((app.cy, app.cx), (2, 4));
+        app.search(true);
+        assert_eq!((app.cy, app.cx), (2, 8));
+        app.search(true);
+        assert_eq!((app.cy, app.cx), (0, 4), "did not wrap to the first line");
+    }
+
+    #[test]
+    fn a_search_with_nothing_to_find_leaves_the_cursor_alone() {
+        let mut app = app_over(&["one", "two"], "absent");
+        let before = (app.cy, app.cx);
+        app.search(true);
+        assert_eq!((app.cy, app.cx), before);
+        assert!(app.msg.contains("not found"), "{}", app.msg);
+        // An empty query is how the highlight is cleared; it must not move
+        // anything either.
+        app.last_query.clear();
+        app.search(true);
+        assert_eq!((app.cy, app.cx), before);
     }
 
     #[test]
