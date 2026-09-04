@@ -92,6 +92,10 @@ hand the same buffer to nvim.
   as literal `[36m` noise. Colours inside nvim would need a plugin that
   interprets ANSI (`baleia.nvim`, `AnsiEsc`) — the stripping is here, in
   `main.rs`, if you have one.
+- Trailing blank lines are trimmed — empty ones and ones padded out with
+  spaces — so a dump does not open with dead space below the output. "Blank"
+  means blank *on screen*: spaces carrying a background, a reverse or an
+  underline are a visible bar (a statusline is exactly that) and are kept.
 - Cursor-positioning escapes are ignored, so a dump of a full-screen TUI
   (nvim's own screen, `htop`) is read as the text stream it is, not replayed as
   a grid.

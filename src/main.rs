@@ -346,6 +346,18 @@ fn extended_colour(rest: &[Option<i64>]) -> Option<(Color, usize)> {
     None
 }
 
+/// Whether a line would leave the screen as it found it.
+///
+/// Every character is whitespace AND no cell carries something that paints on a
+/// space: a background, a reverse (which turns the foreground into one), or an
+/// underline. Foreground and bold are invisible on a space and do not count.
+fn paints_nothing(line: &[char], style: &[Cell]) -> bool {
+    line.iter().all(|c| c.is_whitespace())
+        && style
+            .iter()
+            .all(|c| c.bg.is_none() && !c.reverse && !c.underline)
+}
+
 // Parse the (possibly ANSI-styled) dump into plain chars + a parallel colour map.
 fn load(path: &str) -> (Vec<Vec<char>>, Vec<Vec<Cell>>) {
     let raw = std::fs::read(path).unwrap_or_default();
@@ -422,7 +434,18 @@ fn load(path: &str) -> (Vec<Vec<char>>, Vec<Vec<Cell>>) {
     lines.push(cur_c);
     styles.push(cur_s);
 
-    while lines.len() > 1 && lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+    // A dump ends in whatever was below the last output: empty lines, and lines
+    // padded out with spaces. Both are dead space at the bottom of copy mode.
+    //
+    // "Blank" has to mean blank on screen, not blank in the text. Spaces with a
+    // background, a reverse or an underline are a visible bar — a statusline is
+    // exactly that — and trimming one would delete something the pane showed.
+    while lines.len() > 1
+        && lines
+            .last()
+            .zip(styles.last())
+            .is_some_and(|(l, s)| paints_nothing(l, s))
+    {
         lines.pop();
         styles.pop();
     }
@@ -524,7 +547,7 @@ fn draw(app: &App) -> std::io::Result<()> {
         used += help.chars().count();
     }
     if used < app.cols {
-        let fill: String = std::iter::repeat(' ').take(app.cols - used).collect();
+        let fill = " ".repeat(app.cols - used);
         queue!(out, SetBackgroundColor(Color::Reset), Print(fill))?;
     }
     queue!(out, ResetColor)?;
@@ -853,6 +876,47 @@ mod tests {
         let cell = style(&["31", "38;2;255"]);
         assert_eq!(cell.fg, Some(Color::AnsiValue(1)));
         assert!(extended_colour(&[Some(9)]).is_none());
+    }
+
+    /// Write a dump, parse it, clean up. The parser's only real input is a file.
+    fn parse_file(tag: &str, body: &str) -> (Vec<Vec<char>>, Vec<Vec<Cell>>) {
+        let dir = std::env::temp_dir().join(format!(
+            "lvim-zcopy-test-{}-{tag}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("dump");
+        std::fs::write(&path, body).expect("write");
+        let out = load(path.to_str().unwrap_or_default());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+        out
+    }
+
+    #[test]
+    fn trailing_blank_lines_are_trimmed_however_they_are_spelled() {
+        // Empty, and padded out with spaces: both are dead space below the
+        // output, and a pane dump produces both.
+        let (lines, _) = parse_file("trim", "text\n\n    \n\t\n\n");
+        assert_eq!(lines.len(), 1, "got {lines:?}");
+        assert_eq!(lines[0].iter().collect::<String>(), "text");
+    }
+
+    #[test]
+    fn a_coloured_bar_of_spaces_is_not_blank() {
+        // A statusline is spaces with a background. Trimming it would delete
+        // something the pane actually showed.
+        let (lines, style) = parse_file("bar", "text\n\x1b[48;5;236m      \x1b[0m\n");
+        assert_eq!(lines.len(), 2, "the coloured bar was trimmed: {lines:?}");
+        assert_eq!(style[1][0].bg, Some(Color::AnsiValue(236)));
+        // Reverse and underline paint on a space too.
+        let (lines, _) = parse_file("rev", "text\n\x1b[7m   \x1b[0m\n");
+        assert_eq!(lines.len(), 2, "a reversed bar was trimmed");
+        let (lines, _) = parse_file("ul", "text\n\x1b[4m   \x1b[0m\n");
+        assert_eq!(lines.len(), 2, "an underlined bar was trimmed");
+        // ...but a plain foreground on spaces is invisible, so it is blank.
+        let (lines, _) = parse_file("fg", "text\n\x1b[31m   \x1b[0m\n");
+        assert_eq!(lines.len(), 1, "an invisible line was kept");
     }
 
     #[test]
