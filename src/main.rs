@@ -30,10 +30,23 @@ use crossterm::{
     },
 };
 
-#[derive(Clone, Copy)]
+/// One character's appearance, as the dump described it.
+///
+/// `None` means "whatever the terminal's default is" — not black and not white,
+/// because the pane this came from was drawn against the user's own background
+/// and a guessed colour would be wrong on half the themes.
+///
+/// Doubles as the running style while the dump is parsed: SGR is a state
+/// machine over exactly these fields, so the parser's state and a cell's
+/// appearance are the same thing.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Cell {
     fg: Option<Color>,
+    bg: Option<Color>,
     bold: bool,
+    italic: bool,
+    underline: bool,
+    reverse: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -237,40 +250,100 @@ fn sgr_color(code: i64) -> Option<Color> {
     }
 }
 
-fn apply_sgr(params: &str, fg: &mut Option<Color>, bold: &mut bool) {
-    let codes: Vec<i64> = if params.is_empty() {
-        vec![0]
+fn apply_sgr(params: &str, st: &mut Cell) {
+    // A field can be empty — `\x1b[;1m`, and the colour-space slot in
+    // `38:2::R:G:B` — so a field is an Option, not a number defaulted to 0.
+    // Read as 0, that empty slot would be taken for the red component and the
+    // colour would come out shifted.
+    let codes: Vec<Option<i64>> = if params.is_empty() {
+        vec![Some(0)]
     } else {
-        params.split(';').map(|s| s.parse().unwrap_or(0)).collect()
+        params
+            .split([';', ':'])
+            .map(|f| if f.is_empty() { None } else { f.parse().ok() })
+            .collect()
     };
+
     let mut k = 0;
     while k < codes.len() {
-        match codes[k] {
-            0 => {
-                *fg = None;
-                *bold = false;
-            }
-            1 => *bold = true,
-            22 => *bold = false,
-            30..=37 | 90..=97 => *fg = sgr_color(codes[k]),
-            39 => *fg = None,
-            38 => {
-                if k + 2 < codes.len() && codes[k + 1] == 5 {
-                    *fg = Some(Color::AnsiValue(codes[k + 2] as u8));
-                    k += 2;
-                } else if k + 4 < codes.len() && codes[k + 1] == 2 {
-                    *fg = Some(Color::Rgb {
-                        r: codes[k + 2] as u8,
-                        g: codes[k + 3] as u8,
-                        b: codes[k + 4] as u8,
-                    });
-                    k += 4;
+        let Some(code) = codes[k] else {
+            k += 1;
+            continue;
+        };
+        match code {
+            0 => *st = Cell::default(),
+            1 => st.bold = true,
+            3 => st.italic = true,
+            4 => st.underline = true,
+            7 => st.reverse = true,
+            22 => st.bold = false,
+            23 => st.italic = false,
+            24 => st.underline = false,
+            27 => st.reverse = false,
+            30..=37 | 90..=97 => st.fg = sgr_color(code),
+            39 => st.fg = None,
+            // The backgrounds. Their absence is what made a neovim scrollback
+            // look colourless: an editor paints its theme mostly with the
+            // background — the whole surface, the visual selection, the
+            // statusline, the cursor line — and only some of it with the
+            // foreground.
+            40..=47 | 100..=107 => st.bg = sgr_color(code - 10),
+            49 => st.bg = None,
+            38 | 48 => {
+                if let Some((colour, used)) = extended_colour(&codes[k + 1..]) {
+                    if code == 38 {
+                        st.fg = Some(colour);
+                    } else {
+                        st.bg = Some(colour);
+                    }
+                    k += used;
                 }
             }
             _ => {}
         }
         k += 1;
     }
+}
+
+/// The colour after a `38`/`48`, and how many fields it took.
+///
+/// Two forms: `5;n` for a palette index, `2;r;g;b` for a truecolour. Empty
+/// fields are skipped rather than counted, which is what makes the colon form
+/// (`38:2::R:G:B`, with an empty colour-space slot) read the same as the
+/// semicolon one.
+///
+/// `None` for anything else — a truncated sequence at the end of the params, or
+/// a form we do not know. The style then simply keeps the colour it had, which
+/// is the only safe answer: guessing a colour here paints the wrong one for the
+/// rest of the line.
+fn extended_colour(rest: &[Option<i64>]) -> Option<(Color, usize)> {
+    let mut want = 0usize;
+    let mut vals: Vec<i64> = Vec::new();
+    for (i, field) in rest.iter().enumerate() {
+        let Some(v) = *field else { continue };
+        if want == 0 {
+            want = match v {
+                5 => 1,
+                2 => 3,
+                _ => return None,
+            };
+            continue;
+        }
+        vals.push(v);
+        if vals.len() == want {
+            let colour = match vals[..] {
+                [n] => Color::AnsiValue(n.clamp(0, 255) as u8),
+                [r, g, b] => Color::Rgb {
+                    r: r.clamp(0, 255) as u8,
+                    g: g.clamp(0, 255) as u8,
+                    b: b.clamp(0, 255) as u8,
+                },
+                _ => return None,
+            };
+            return Some((colour, i + 1));
+        }
+    }
+    None
 }
 
 // Parse the (possibly ANSI-styled) dump into plain chars + a parallel colour map.
@@ -284,8 +357,7 @@ fn load(path: &str) -> (Vec<Vec<char>>, Vec<Vec<Cell>>) {
     let mut styles: Vec<Vec<Cell>> = Vec::new();
     let mut cur_c: Vec<char> = Vec::new();
     let mut cur_s: Vec<Cell> = Vec::new();
-    let mut fg: Option<Color> = None;
-    let mut bold = false;
+    let mut style = Cell::default();
 
     let is_final = |c: char| {
         let u = c as u32;
@@ -306,9 +378,17 @@ fn load(path: &str) -> (Vec<Vec<char>>, Vec<Vec<Cell>>) {
                 }
                 let fin = if j < len { ch[j] } else { '\0' };
                 if fin == 'm' {
-                    // strip a leading '?' or private markers defensively
-                    let p: String = params.chars().filter(|c| c.is_ascii_digit() || *c == ';').collect();
-                    apply_sgr(&p, &mut fg, &mut bold);
+                    // Keep ':' as well as ';': SGR has a subparameter form and
+                    // real programs use it — `4:3` for a curly underline, and
+                    // `38:2::R:G:B` for a truecolour. Dropping the colons used
+                    // to turn those into one unparseable number, which is a
+                    // silent loss of exactly the colours this parser is for.
+                    // Private markers ('?', '>') are still dropped.
+                    let p: String = params
+                        .chars()
+                        .filter(|c| c.is_ascii_digit() || *c == ';' || *c == ':')
+                        .collect();
+                    apply_sgr(&p, &mut style);
                 }
                 i = j + 1;
                 continue;
@@ -335,7 +415,7 @@ fn load(path: &str) -> (Vec<Vec<char>>, Vec<Vec<Cell>>) {
             i += 1;
         } else {
             cur_c.push(c);
-            cur_s.push(Cell { fg, bold });
+            cur_s.push(style);
             i += 1;
         }
     }
@@ -351,6 +431,36 @@ fn load(path: &str) -> (Vec<Vec<char>>, Vec<Vec<Cell>>) {
         styles.push(Vec::new());
     }
     (lines, styles)
+}
+
+/// Establish `cell` on the terminal, from a clean slate.
+///
+/// A full reset first, then only what is on. Emitting the whole style rather
+/// than the difference from the previous one is a few more bytes on a colourful
+/// line and removes the entire class of bugs where an attribute is turned on
+/// and never turned back off — a stray bold or, worse, a background that runs
+/// to the end of the screen.
+fn write_style(out: &mut impl Write, cell: Cell) -> std::io::Result<()> {
+    queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
+    if let Some(fg) = cell.fg {
+        queue!(out, SetForegroundColor(fg))?;
+    }
+    if let Some(bg) = cell.bg {
+        queue!(out, SetBackgroundColor(bg))?;
+    }
+    if cell.bold {
+        queue!(out, SetAttribute(Attribute::Bold))?;
+    }
+    if cell.italic {
+        queue!(out, SetAttribute(Attribute::Italic))?;
+    }
+    if cell.underline {
+        queue!(out, SetAttribute(Attribute::Underlined))?;
+    }
+    if cell.reverse {
+        queue!(out, SetAttribute(Attribute::Reverse))?;
+    }
+    Ok(())
 }
 
 fn draw(app: &App) -> std::io::Result<()> {
@@ -370,42 +480,23 @@ fn draw(app: &App) -> std::io::Result<()> {
         let line = &app.lines[li];
         let styl = &app.style[li];
         let end = (app.left + app.cols).min(line.len());
-        let mut col = app.left;
-        let mut rev = false;
-        let mut cur_fg: Option<Color> = Some(Color::Reset);
-        let mut cur_bold = false;
-        while col < end {
-            let sel = app.in_selection(li, col);
-            if sel != rev {
-                queue!(
-                    out,
-                    SetAttribute(if sel {
-                        Attribute::Reverse
-                    } else {
-                        Attribute::NoReverse
-                    })
-                )?;
-                rev = sel;
+        // The style last written to the terminal. The row began with a reset,
+        // so that is the default cell; a run of identically-styled characters
+        // then costs one escape sequence, however long it is.
+        let mut applied = Cell::default();
+        for (col, ch) in line.iter().enumerate().take(end).skip(app.left) {
+            let mut want = styl.get(col).copied().unwrap_or_default();
+            // The selection inverts whatever the cell already looks like rather
+            // than forcing one colour on it: a cell that is already reversed
+            // (a statusline, a highlighted match) has to come back OUT of
+            // reverse inside the selection, or it would be the one part of the
+            // selection that does not look selected.
+            want.reverse ^= app.in_selection(li, col);
+            if want != applied {
+                write_style(&mut out, want)?;
+                applied = want;
             }
-            let cell = styl.get(col).copied().unwrap_or(Cell { fg: None, bold: false });
-            let want_fg = cell.fg.or(Some(Color::Reset));
-            if want_fg != cur_fg {
-                queue!(out, SetForegroundColor(want_fg.unwrap()))?;
-                cur_fg = want_fg;
-            }
-            if cell.bold != cur_bold {
-                queue!(
-                    out,
-                    SetAttribute(if cell.bold {
-                        Attribute::Bold
-                    } else {
-                        Attribute::NormalIntensity
-                    })
-                )?;
-                cur_bold = cell.bold;
-            }
-            queue!(out, Print(line[col]))?;
-            col += 1;
+            queue!(out, Print(ch))?;
         }
         queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
     }
@@ -683,5 +774,105 @@ fn main() {
     if let Some(text) = copied {
         copy_to_clipboard(&text);
         eprintln!("lvim-zcopy: copied {} chars", text.chars().count());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The style a run of SGR parameters leaves behind.
+    fn style(params: &[&str]) -> Cell {
+        let mut cell = Cell::default();
+        for p in params {
+            apply_sgr(p, &mut cell);
+        }
+        cell
+    }
+
+    #[test]
+    fn backgrounds_are_read() {
+        // The whole point: an editor paints its theme with the background.
+        assert_eq!(style(&["41"]).bg, Some(Color::AnsiValue(1)));
+        assert_eq!(style(&["104"]).bg, Some(Color::AnsiValue(12)));
+        assert_eq!(style(&["48;5;236"]).bg, Some(Color::AnsiValue(236)));
+        assert_eq!(
+            style(&["48;2;40;44;52"]).bg,
+            Some(Color::Rgb { r: 40, g: 44, b: 52 })
+        );
+        // ...and are given back.
+        assert_eq!(style(&["41", "49"]).bg, None);
+        assert_eq!(style(&["41", "0"]).bg, None);
+    }
+
+    #[test]
+    fn a_background_does_not_disturb_the_foreground() {
+        let cell = style(&["38;5;203;48;5;236"]);
+        assert_eq!(cell.fg, Some(Color::AnsiValue(203)));
+        assert_eq!(cell.bg, Some(Color::AnsiValue(236)));
+    }
+
+    #[test]
+    fn the_colon_form_reads_the_same_as_the_semicolon_form() {
+        // `38:2::R:G:B` carries an empty colour-space field. Read as a zero it
+        // would be taken for the red component and every value would shift by
+        // one — a wrong colour rather than a missing one.
+        let semi = style(&["38;2;255;128;0"]);
+        let colon = style(&["38:2::255:128:0"]);
+        assert_eq!(colon.fg, semi.fg);
+        assert_eq!(
+            colon.fg,
+            Some(Color::Rgb { r: 255, g: 128, b: 0 })
+        );
+        // The short colon form, without the empty slot.
+        assert_eq!(style(&["48:5:236"]).bg, Some(Color::AnsiValue(236)));
+    }
+
+    #[test]
+    fn attributes_go_on_and_off() {
+        let on = style(&["1;3;4;7"]);
+        assert!(on.bold && on.italic && on.underline && on.reverse);
+        let off = style(&["1;3;4;7", "22;23;24;27"]);
+        assert!(!off.bold && !off.italic && !off.underline && !off.reverse);
+        // A styled underline (`4:3` is curly) is still an underline.
+        assert!(style(&["4:3"]).underline);
+    }
+
+    #[test]
+    fn a_reset_clears_everything() {
+        let cell = style(&["1;4;38;5;9;48;5;236", "0"]);
+        assert_eq!(cell, Cell::default());
+        // An empty parameter list means 0.
+        assert_eq!(style(&["1;41", ""]), Cell::default());
+    }
+
+    #[test]
+    fn a_truncated_colour_leaves_the_style_alone() {
+        // Keeping the previous colour is the only safe answer: a guess here
+        // paints the wrong colour for the rest of the line.
+        let cell = style(&["31", "38;2;255"]);
+        assert_eq!(cell.fg, Some(Color::AnsiValue(1)));
+        assert!(extended_colour(&[Some(9)]).is_none());
+    }
+
+    #[test]
+    fn the_dump_becomes_lines_with_a_colour_for_every_character() {
+        let dir = std::env::temp_dir().join(format!("lvim-zcopy-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("dump");
+        std::fs::write(&path, "\x1b[48;5;236m\x1b[38;5;203mred\x1b[0m plain\nsecond\n")
+            .expect("write");
+
+        let (lines, style) = load(path.to_str().unwrap_or_default());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].iter().collect::<String>(), "red plain");
+        assert_eq!(lines[1].iter().collect::<String>(), "second");
+        // The escapes are gone from the text but not from the appearance.
+        assert_eq!(style[0][0].bg, Some(Color::AnsiValue(236)));
+        assert_eq!(style[0][0].fg, Some(Color::AnsiValue(203)));
+        assert_eq!(style[0][4].bg, None, "the reset must end the background");
     }
 }

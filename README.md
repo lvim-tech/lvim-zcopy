@@ -77,6 +77,24 @@ hand the same buffer to nvim.
   `xclip -selection clipboard` / `-selection primary`.
 - Selection, search and yank operate on plain text; the ANSI colours are a
   render-only layer, so copied text never carries escape codes.
+- **Colours.** Foreground *and* background, 16 / 256 / truecolour, plus bold,
+  italic, underline and reverse. Backgrounds matter more than they sound: an
+  editor paints its theme mostly with the background — the surface, the visual
+  selection, the statusline, the cursor line — so a scrollback of a `nvim`
+  session looked washed out until they were read. Both SGR spellings are
+  understood, `38;2;R;G;B` and the subparameter form `38:2::R:G:B` (whose empty
+  colour-space slot must be skipped, not read as the red component).
+- The selection **inverts** whatever a cell already looks like rather than
+  forcing one colour on it, so a cell that was already reversed comes back out
+  of reverse inside the selection instead of being the one part that does not
+  look selected.
+- `o` hands **plain** text to nvim, deliberately: nvim would render the escapes
+  as literal `[36m` noise. Colours inside nvim would need a plugin that
+  interprets ANSI (`baleia.nvim`, `AnsiEsc`) — the stripping is here, in
+  `main.rs`, if you have one.
+- Cursor-positioning escapes are ignored, so a dump of a full-screen TUI
+  (nvim's own screen, `htop`) is read as the text stream it is, not replayed as
+  a grid.
 
 ## License
 
