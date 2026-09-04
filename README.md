@@ -89,9 +89,24 @@ hand the same buffer to nvim.
   of reverse inside the selection instead of being the one part that does not
   look selected.
 - `o` hands **plain** text to nvim, deliberately: nvim would render the escapes
-  as literal `[36m` noise. Colours inside nvim would need a plugin that
-  interprets ANSI (`baleia.nvim`, `AnsiEsc`) — the stripping is here, in
-  `main.rs`, if you have one.
+  as literal `[36m` noise. The colours travel beside the text instead — a
+  `.spans` sidecar written next to the plain copy, which
+  [lvim-ansi](https://github.com/lvim-tech/lvim-ansi) turns into extmarks:
+
+  ```text
+  /tmp/lvim-zcopy-plain-<pid>.txt     the plain text nvim opens
+  /tmp/lvim-zcopy-plain-<pid>.spans   line<TAB>byte_start<TAB>byte_end<TAB>fg<TAB>bg<TAB>flags
+  ```
+
+  `line` is 0-based, `byte_end` is exclusive, offsets are **bytes** (extmarks
+  count bytes; Cyrillic and Nerd Font glyphs are 2–4 of them each), `fg`/`bg`
+  are `-` / `iN` / `#rrggbb`, and `flags` is a subset of `biur`. Ranges never
+  overlap, come sorted, merge identical neighbours, and a fully-default range is
+  not written at all. So the buffer stays plain — search, yank and the columns
+  keep working, no escape ever reaches a register — while the ANSI is parsed
+  exactly once, here, by the parser that is already tested. It is decoration
+  only: without the sidecar, or without the plugin installed, `o` still opens
+  nvim, just without the colours.
 - Trailing blank lines are trimmed — empty ones and ones padded out with
   spaces — so a dump does not open with dead space below the output. "Blank"
   means blank *on screen*: spaces carrying a background, a reverse or an

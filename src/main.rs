@@ -456,6 +456,106 @@ fn load(path: &str) -> (Vec<Vec<char>>, Vec<Vec<Cell>>) {
     (lines, styles)
 }
 
+/// One colour, the way the `.spans` sidecar spells it: `-` for the terminal's
+/// own default, `iN` for a palette index (0–255), `#rrggbb` for a truecolour.
+///
+/// The default has to stay a default all the way to the editor. Naming a
+/// concrete colour here would paint the pane's background over the editor's
+/// own, and a dump is read against whatever theme the reader has.
+fn span_colour(colour: Option<Color>) -> String {
+    match colour {
+        Some(Color::AnsiValue(n)) => format!("i{n}"),
+        Some(Color::Rgb { r, g, b }) => format!("#{r:02x}{g:02x}{b:02x}"),
+        // The parser produces only those two; anything else is a colour we
+        // cannot name in this format, and the default is the honest answer.
+        _ => String::from("-"),
+    }
+}
+
+/// A cell's attributes as a subset of `biur`, or `-` when it carries none.
+fn span_flags(cell: &Cell) -> String {
+    let mut out = String::new();
+    if cell.bold {
+        out.push('b');
+    }
+    if cell.italic {
+        out.push('i');
+    }
+    if cell.underline {
+        out.push('u');
+    }
+    if cell.reverse {
+        out.push('r');
+    }
+    if out.is_empty() {
+        out.push('-');
+    }
+    out
+}
+
+/// Append one styled range to the document, unless it is entirely default.
+///
+/// A default range asks the editor to do what it already does, and a scrollback
+/// is mostly default — dropping them is what keeps the sidecar the size of the
+/// colour in the dump rather than the size of the dump.
+fn push_span(out: &mut String, line: usize, start: usize, end: usize, cell: &Cell) {
+    if *cell == Cell::default() {
+        return;
+    }
+    use std::fmt::Write;
+    let _ = writeln!(
+        out,
+        "{line}\t{start}\t{end}\t{}\t{}\t{}",
+        span_colour(cell.fg),
+        span_colour(cell.bg),
+        span_flags(cell)
+    );
+}
+
+/// The `.spans` sidecar for a parsed dump: the colours as byte ranges over the
+/// PLAIN text, one range per output line, TAB-separated:
+///
+/// ```text
+/// line<TAB>byte_start<TAB>byte_end<TAB>fg<TAB>bg<TAB>flags
+/// ```
+///
+/// `line` is 0-based (what `nvim_buf_set_extmark` wants), `byte_end` is
+/// exclusive, ranges never overlap and come out sorted by `(line, byte_start)`.
+/// Neighbouring characters with the same appearance are one range, so a
+/// uniformly-coloured line costs one row, not one row per character.
+///
+/// BYTES, not characters. `lines` is `Vec<Vec<char>>` but the editor on the
+/// other side counts bytes, so offsets advance by `ch.len_utf8()`. Cyrillic and
+/// Nerd Font glyphs are 2–4 bytes each: counted as characters, every colour
+/// after the first such glyph would slide left, and the offset would eventually
+/// land inside a character, which nvim rejects outright.
+fn build_spans(lines: &[Vec<char>], styles: &[Vec<Cell>]) -> String {
+    let mut out = String::new();
+    let empty: Vec<Cell> = Vec::new();
+    for (li, line) in lines.iter().enumerate() {
+        let style = styles.get(li).unwrap_or(&empty);
+        // The open run: the byte it started at, and the appearance it carries.
+        let mut run: Option<(usize, Cell)> = None;
+        let mut byte = 0usize;
+        for (ci, ch) in line.iter().enumerate() {
+            let cell = style.get(ci).copied().unwrap_or_default();
+            match run {
+                Some((_, prev)) if prev == cell => {}
+                Some((start, prev)) => {
+                    push_span(&mut out, li, start, byte, &prev);
+                    run = Some((byte, cell));
+                }
+                None => run = Some((byte, cell)),
+            }
+            byte += ch.len_utf8();
+        }
+        if let Some((start, prev)) = run {
+            push_span(&mut out, li, start, byte, &prev);
+        }
+    }
+    out
+}
+
 /// Establish `cell` on the terminal, from a clean slate.
 ///
 /// A full reset first, then only what is on. Emitting the whole style rather
@@ -783,13 +883,30 @@ fn main() {
             .map(|l| l.iter().collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        let tmp = format!("/tmp/lvim-zcopy-plain-{}.txt", std::process::id());
-        let target = if std::fs::write(&tmp, plain).is_ok() {
-            tmp
+        let base = format!("/tmp/lvim-zcopy-plain-{}", std::process::id());
+        let txt = format!("{base}.txt");
+        let mut cmd = Command::new("nvim");
+        if std::fs::write(&txt, plain).is_ok() {
+            cmd.arg(&txt);
+            // The colours travel BESIDE the text, not inside it: a sidecar of byte
+            // ranges that lvim-ansi turns into extmarks. The buffer stays plain, so
+            // search, yank and the columns keep working and no escape ever reaches a
+            // register — and the ANSI is parsed once, here, by the parser that is
+            // already tested, instead of a second time in Lua.
+            //
+            // Decoration is all it is. If the sidecar cannot be written we simply do
+            // not ask for it, and the `pcall` means a missing plugin costs nothing
+            // either: nvim opens the dump regardless, just without the colours.
+            let spans = format!("{base}.spans");
+            if std::fs::write(&spans, build_spans(&app.lines, &app.style)).is_ok() {
+                cmd.arg("-c").arg(format!(
+                    "lua local ok, m = pcall(require, 'lvim-ansi') if ok then m.attach(0, '{spans}') end"
+                ));
+            }
         } else {
-            path.clone()
-        };
-        let err = Command::new("nvim").arg(&target).exec();
+            cmd.arg(&path);
+        }
+        let err = cmd.exec();
         eprintln!("lvim-zcopy: could not exec nvim: {err}");
         std::process::exit(1);
     }
@@ -917,6 +1034,138 @@ mod tests {
         // ...but a plain foreground on spaces is invisible, so it is blank.
         let (lines, _) = parse_file("fg", "text\n\x1b[31m   \x1b[0m\n");
         assert_eq!(lines.len(), 1, "an invisible line was kept");
+    }
+
+    // ---- the .spans sidecar ----
+
+    /// Read one colour field back out of the sidecar.
+    fn span_colour_back(field: &str) -> Option<Color> {
+        if field == "-" {
+            return None;
+        }
+        if let Some(n) = field.strip_prefix('i') {
+            return Some(Color::AnsiValue(n.parse().expect("palette index")));
+        }
+        let hex = field.strip_prefix('#').expect("colour field");
+        Some(Color::Rgb {
+            r: u8::from_str_radix(&hex[0..2], 16).expect("r"),
+            g: u8::from_str_radix(&hex[2..4], 16).expect("g"),
+            b: u8::from_str_radix(&hex[4..6], 16).expect("b"),
+        })
+    }
+
+    /// Lay a `.spans` document back over the text, the way lvim-ansi does: every
+    /// character starts default and only the written ranges paint. Asserts the
+    /// invariants a consumer relies on — six fields, sorted, non-overlapping, and
+    /// every offset on a character boundary.
+    fn apply_spans(spans: &str, lines: &[Vec<char>]) -> Vec<Vec<Cell>> {
+        let mut out: Vec<Vec<Cell>> = lines.iter().map(|l| vec![Cell::default(); l.len()]).collect();
+        let mut previous = (0usize, 0usize); // (line, byte_end) of the last range
+        for row in spans.lines() {
+            let f: Vec<&str> = row.split('\t').collect();
+            assert_eq!(f.len(), 6, "malformed row {row:?}");
+            let li: usize = f[0].parse().expect("line");
+            let start: usize = f[1].parse().expect("byte_start");
+            let end: usize = f[2].parse().expect("byte_end");
+            assert!(start < end, "empty range in {row:?}");
+            assert!(
+                (li, start) >= previous,
+                "{row:?} overlaps or precedes the previous range {previous:?}"
+            );
+            previous = (li, end);
+
+            let mut cell = Cell {
+                fg: span_colour_back(f[3]),
+                bg: span_colour_back(f[4]),
+                ..Cell::default()
+            };
+            if f[5] != "-" {
+                for flag in f[5].chars() {
+                    match flag {
+                        'b' => cell.bold = true,
+                        'i' => cell.italic = true,
+                        'u' => cell.underline = true,
+                        'r' => cell.reverse = true,
+                        other => panic!("unknown flag {other:?} in {row:?}"),
+                    }
+                }
+            }
+            assert_ne!(
+                cell,
+                Cell::default(),
+                "a fully-default range was written: {row:?}"
+            );
+
+            let text: String = lines[li].iter().collect();
+            assert!(
+                text.is_char_boundary(start),
+                "{start} splits a character in {text:?}"
+            );
+            assert!(
+                text.is_char_boundary(end),
+                "{end} splits a character in {text:?}"
+            );
+            for (ci, (bi, _)) in text.char_indices().enumerate() {
+                if bi >= start && bi < end {
+                    out[li][ci] = cell;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_offsets_are_bytes_and_land_on_character_boundaries() {
+        // The whole hazard in one line: Cyrillic is two bytes a character, so a
+        // char-counted offset would say 6 where the editor needs 12 — the colour
+        // would end mid-word and the next one would land inside a character.
+        let (lines, styles) = parse_file("cyr", "\x1b[31mПривет\x1b[0m свят\n");
+        let spans = build_spans(&lines, &styles);
+        assert_eq!(spans.trim_end(), "0\t0\t12\ti1\t-\t-", "got {spans:?}");
+        let text: String = lines[0].iter().collect();
+        assert!(text.is_char_boundary(12));
+        assert_eq!(&text[0..12], "Привет");
+    }
+
+    #[test]
+    fn identical_neighbours_are_one_range_not_one_per_character() {
+        let (lines, styles) = parse_file("merge", "\x1b[1;38;5;203mabcdefgh\x1b[0m\n");
+        let spans = build_spans(&lines, &styles);
+        assert_eq!(
+            spans.lines().count(),
+            1,
+            "one range per character: {spans:?}"
+        );
+        assert_eq!(spans.trim_end(), "0\t0\t8\ti203\t-\tb");
+    }
+
+    #[test]
+    fn a_default_line_writes_nothing_at_all() {
+        // A scrollback is mostly plain; if the default cost a row the sidecar
+        // would be the size of the dump.
+        let (lines, styles) = parse_file("plain", "just text\nmore text\n");
+        assert_eq!(build_spans(&lines, &styles), "");
+        // ...and a coloured dump only pays for the coloured part of it.
+        let (lines, styles) = parse_file("mixed", "plain\n\x1b[32mgreen\x1b[0m\nplain\n");
+        assert_eq!(build_spans(&lines, &styles).trim_end(), "1\t0\t5\ti2\t-\t-");
+    }
+
+    #[test]
+    fn the_ranges_rebuild_the_styles_they_came_from() {
+        // Everything at once: both colour forms, every attribute, an attribute
+        // turned back off mid-line, a coloured bar of spaces, multi-byte text and
+        // an ordinary line — applied back over the text, the ranges must give the
+        // same cells `load` returned.
+        let body = concat!(
+            "\x1b[1;38;5;203;48;5;236mПривет\x1b[0m plain\n",
+            "\x1b[4;38;2;203;79;79mсвят\x1b[24m и\x1b[7m ok\x1b[0m tail\n",
+            "\x1b[48;5;236m      \x1b[0m\n",
+            "ordinary ‧ Nerd\u{f07b} glyph\n",
+        );
+        let (lines, styles) = parse_file("round", body);
+        let spans = build_spans(&lines, &styles);
+        assert!(!spans.is_empty());
+        assert_eq!(apply_spans(&spans, &lines), styles);
     }
 
     #[test]
