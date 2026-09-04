@@ -38,7 +38,7 @@ so it pastes with `Ctrl+V` *and* middle-click.
 | `Ctrl-f`/`Ctrl-b`, `PageUp`/`PageDown` | page |
 | `Ctrl-d` / `Ctrl-u` | half page |
 | `w` / `b` | word forward / back |
-| `/`, then `n` / `N` | search, next / prev |
+| `/`, then `n` / `N` | search, next / prev — every match is highlighted |
 | `v` / `V` | char / line visual selection |
 | `y` or `Enter` | yank selection (or current line) → clipboard, quit |
 | `o` | open the same buffer in `nvim` |
@@ -77,6 +77,14 @@ hand the same buffer to nvim.
   `xclip -selection clipboard` / `-selection primary`.
 - Selection, search and yank operate on plain text; the ANSI colours are a
   render-only layer, so copied text never carries escape codes.
+- **Search** highlights every match on screen, not only the one under the
+  cursor, with the current one in a brighter colour. `n` and `N` step through
+  *every* match — including a second one on the same line, which the older
+  per-line search skipped. Both the stepping and the painting go through one
+  matcher, so what `n` visits and what the screen lights up cannot become two
+  different answers. Matches are counted in columns, not bytes, or a line with
+  any Cyrillic in it would light up in the wrong place. `/` followed by Enter
+  on an empty query clears the highlighting.
 - **Colours.** Foreground *and* background, 16 / 256 / truecolour, plus bold,
   italic, underline and reverse. Backgrounds matter more than they sound: an
   editor paints its theme mostly with the background — the surface, the visual
