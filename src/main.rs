@@ -913,6 +913,68 @@ fn main() {
                 }
                 app.cx = i;
             }
+            KeyCode::Char('e') if !ctrl => {
+                let mut l = &app.lines[app.cy];
+                let mut endl = if !l.is_empty() { l.len() - 1 } else { 0 };
+                let mut i = app.cx;
+
+                if i + 1 < endl {
+                    i += 1;
+                } else if app.cy < last {
+                    app.cy += 1;
+                    i = 0;
+                    l = &app.lines[app.cy];
+                    endl = if !l.is_empty() { l.len() - 1 } else { 0 };
+                }
+                while i < endl && l[i].is_whitespace() {
+                    i += 1;
+                }
+
+                if i < endl {
+                    if is_word(l[i]) {
+                        while i < endl && is_word(l[i]) {
+                            i += 1;
+                        }
+                        if i > 0 && !is_word(l[i]) {
+                            i -= 1;
+                        }
+                    } else {
+                        while i < endl && !is_word(l[i]) {
+                            i += 1;
+                        }
+                        if i > 0 && is_word(l[i]) {
+                            i -= 1;
+                        }
+                    }
+                }
+                app.cx = i;
+            }
+            KeyCode::Char('E') if !ctrl => {
+                let mut l = &app.lines[app.cy];
+                let mut endl = if !l.is_empty() { l.len() - 1 } else { 0 };
+                let mut i = app.cx;
+
+                if i + 1 < endl {
+                    i += 1;
+                } else if app.cy < last {
+                    app.cy += 1;
+                    i = 0;
+                    l = &app.lines[app.cy];
+                    endl = if !l.is_empty() { l.len() - 1 } else { 0 };
+                }
+                while i < endl && l[i].is_whitespace() {
+                    i += 1;
+                }
+
+                while i < endl && !l[i].is_whitespace() {
+                    i += 1;
+                }
+                if i > 0 && l[i].is_whitespace() {
+                    i -= 1;
+                }
+                app.cx = i;
+                app.clamp_cx();
+            },
             KeyCode::Char('b') if !ctrl => {
                 let l = &app.lines[app.cy];
                 let mut i = app.cx;
