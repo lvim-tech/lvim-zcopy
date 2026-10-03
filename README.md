@@ -37,7 +37,7 @@ so it pastes with `Ctrl+V` *and* middle-click.
 | `g` / `G` | top / bottom |
 | `Ctrl-f`/`Ctrl-b`, `PageUp`/`PageDown` | page |
 | `Ctrl-d` / `Ctrl-u` | half page |
-| `w` / `b` | word forward / back |
+| `w` / `b` / `e` | word forward / back / end |
 | `/`, then `n` / `N` | search, next / prev — every match is highlighted |
 | `v` / `V` | char / line visual selection |
 | `y` or `Enter` | yank selection (or current line) → clipboard, quit |
